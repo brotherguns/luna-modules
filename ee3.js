@@ -1,6 +1,6 @@
 // Settings start
-const USERNAME = "YOUR_USERNAME_HERE";
-const PASSWORD = "YOUR_PASSWORD_HERE";
+const USERNAME = "YOUR_USERNAME_HERE"; // ee3.me username
+const PASSWORD = "YOUR_PASSWORD_HERE"; // ee3.me password
 // Settings end
 
 const BASE_URL = "https://ee3.me";
