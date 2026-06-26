@@ -1,0 +1,20 @@
+{
+    "sourceName": "Bingr",
+    "author": {
+        "name": "brotherguns",
+        "icon": "https://github.com/brotherguns.png"
+    },
+    "iconUrl": "https://bingr.live/favicon.ico",
+    "version": "1.0.0",
+    "language": "en",
+    "baseUrl": "https://bingr.live",
+    "streamType": "hls",
+    "quality": "1080p",
+    "searchBaseUrl": "https://bingr.live",
+    "scriptUrl": "https://raw.githubusercontent.com/brotherguns/luna-modules/main/bingr.js",
+    "softsub": false,
+    "multiStream": false,
+    "multiSubs": false,
+    "type": "tv",
+    "settings": true
+}
