@@ -1,0 +1,20 @@
+{
+    "sourceName": "EE3",
+    "author": {
+        "name": "brotherguns",
+        "icon": "https://github.com/brotherguns.png"
+    },
+    "iconUrl": "https://ee3.me/favicon.png",
+    "version": "1.0.0",
+    "language": "en",
+    "baseUrl": "https://ee3.me",
+    "streamType": "mp4",
+    "quality": "1080p",
+    "searchBaseUrl": "https://ee3.me",
+    "scriptUrl": "https://raw.githubusercontent.com/brotherguns/luna-modules/main/ee3.js",
+    "softsub": false,
+    "multiStream": false,
+    "multiSubs": false,
+    "type": "movie",
+    "settings": true
+}
