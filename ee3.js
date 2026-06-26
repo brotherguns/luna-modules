@@ -8,6 +8,9 @@ const UA = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/6
 
 let _sessionCookie = "";
 let _loginPromise = null;
+// Cache imdb_id and movieId keyed by movie page URL — populated in extractDetails,
+// consumed in extractStreamUrl to avoid re-fetching the HTML page
+const _movieCache = {};
 
 async function ensureSession() {
     if (_sessionCookie) return;
@@ -15,7 +18,6 @@ async function ensureSession() {
     _loginPromise = (async () => {
         try {
             const body = `username=${encodeURIComponent(USERNAME)}&password=${encodeURIComponent(PASSWORD)}`;
-            // redirect=false so we capture the 303 Set-Cookie before following
             const res = await fetchv2(
                 `${BASE_URL}/login`,
                 {
@@ -28,16 +30,13 @@ async function ensureSession() {
                 body,
                 false
             );
-            // On success SvelteKit returns 303 with Set-Cookie: session=VALUE; Path=/; ...
             const headers = res.headers || {};
             const setCookie = headers["set-cookie"] || headers["Set-Cookie"] || "";
             const match = setCookie.match(/session=([^;]+)/);
             if (match) {
                 _sessionCookie = match[1];
             } else {
-                // Login failed — body will have the failure message
-                const text = await res.text();
-                throw new Error("Login failed: " + text);
+                throw new Error("Login failed: " + (await res.text()));
             }
         } finally {
             _loginPromise = null;
@@ -54,6 +53,27 @@ function ee3Headers(extra) {
     };
     if (extra) Object.assign(h, extra);
     return h;
+}
+
+async function fetchMoviePage(url) {
+    const res = await fetchv2(url, {
+        "User-Agent": UA,
+        "Accept": "text/html",
+        "Cookie": `session=${_sessionCookie}`
+    });
+    const html = await res.text();
+    const movieId = url.split("/movies/")[1]?.split("/")[0] || "";
+    const imdbMatch = html.match(/"imdb_id"\s*:\s*"(tt\d+)"/);
+    const imdbId = imdbMatch ? imdbMatch[1] : null;
+
+    // Pull description/year from inline SSR data
+    let tmdb = {};
+    try {
+        const tmdbMatch = html.match(/"tmdb_data"\s*:\s*(\{[^}]{50,}\})/);
+        if (tmdbMatch) tmdb = JSON.parse(tmdbMatch[1]);
+    } catch (e) {}
+
+    return { movieId, imdbId, tmdb };
 }
 
 async function searchResults(keyword) {
@@ -77,66 +97,12 @@ async function searchResults(keyword) {
     }
 }
 
-function parseSvelteKitData(html) {
-    try {
-        const match = html.match(/kit\.start\(app,\s*element,\s*(\{[\s\S]*?\})\s*\)/);
-        if (!match) return null;
-        // kit.start uses a non-standard JSON-like object; extract data array
-        // The structure is {..., data: [...], ...}
-        // Use a regex to find the JSON blob inside kit.start safely
-        const raw = match[1];
-        // Find data array position
-        const dataMatch = raw.match(/"data"\s*:\s*(\[[\s\S]*?\])\s*,\s*"form"/);
-        if (!dataMatch) {
-            // Try broader match
-            const dataMatch2 = raw.match(/"data"\s*:\s*(\[[\s\S]*)/);
-            if (dataMatch2) {
-                try { return JSON.parse(dataMatch2[1].replace(/,\s*"nodes"[\s\S]*$/, "]")); } catch(e) {}
-            }
-            return null;
-        }
-        return JSON.parse(dataMatch[1]);
-    } catch (e) {
-        return null;
-    }
-}
-
-async function getMovieData(url) {
-    const res = await fetchv2(url, {
-        "User-Agent": UA,
-        "Accept": "text/html",
-        "Cookie": `session=${_sessionCookie}`
-    });
-    const html = await res.text();
-
-    // Extract kit.start JSON blob
-    const startMatch = html.match(/kit\.start\(app,\s*element,\s*(\{[\s\S]+?\})\s*\)\s*;?\s*<\/script>/);
-    if (!startMatch) return null;
-
-    try {
-        const blob = JSON.parse(startMatch[1]);
-        const dataArr = blob.data;
-        if (Array.isArray(dataArr)) {
-            for (const node of dataArr) {
-                if (node && node.movie) return node.movie;
-                if (node && node.data && node.data.movie) return node.data.movie;
-            }
-        }
-    } catch (e) {}
-
-    // Fallback: regex-find tmdb block from the raw JSON string in page
-    try {
-        const tmdbMatch = html.match(/"tmdb_data"\s*:\s*(\{[^}]{50,}\})/);
-        if (tmdbMatch) return { tmdb_data: JSON.parse(tmdbMatch[1]) };
-    } catch (e) {}
-    return null;
-}
-
 async function extractDetails(url) {
     try {
         await ensureSession();
-        const movie = await getMovieData(url);
-        const tmdb = (movie && movie.tmdb_data) || {};
+        const { movieId, imdbId, tmdb } = await fetchMoviePage(url);
+        // Populate cache so extractStreamUrl can skip this fetch
+        if (movieId) _movieCache[url] = { movieId, imdbId };
         const description = tmdb.overview || "";
         const airdate = tmdb.release_date ? tmdb.release_date.substring(0, 4) : "";
         const aliases = tmdb.original_title && tmdb.original_title !== tmdb.title ? tmdb.original_title : "";
@@ -147,65 +113,47 @@ async function extractDetails(url) {
 }
 
 async function extractEpisodes(url) {
-    // ee3.me is movies-only
     return JSON.stringify([{ number: 1, href: url }]);
 }
 
 async function extractStreamUrl(url) {
     try {
-        await ensureSession();
-        // Get movie page to find imdb_id and movie id
-        const res = await fetchv2(url, {
-            "User-Agent": UA,
-            "Accept": "text/html",
-            "Cookie": `session=${_sessionCookie}`
-        });
-        const html = await res.text();
+        // Ensure session and get movie identifiers in parallel when possible
+        const sessionPromise = ensureSession();
 
-        // Extract movie id from URL
-        const movieId = url.split("/movies/")[1]?.split("/")[0] || "";
-
-        // Find imdb_id from page HTML
-        let imdbId = null;
-        const imdbMatch = html.match(/"imdb_id"\s*:\s*"(tt\d+)"/);
-        if (imdbMatch) imdbId = imdbMatch[1];
-
-        if (!imdbId) {
-            // Try fetching movie from search API using title parsed from page
-            const titleMatch = html.match(/<title>([^<|]+)/i);
-            if (titleMatch) {
-                const title = titleMatch[1].trim();
-                const searchRes = await fetchv2(
-                    `${BASE_URL}/api/movies?title=${encodeURIComponent(title)}&page=1&perPage=5`,
-                    ee3Headers()
-                );
-                const searchJson = JSON.parse(await searchRes.text());
-                const found = (searchJson.items || []).find(i => i.id === movieId);
-                if (found) imdbId = found.tmdb_data?.imdb_id;
-            }
+        // Use cached imdb_id/movieId from extractDetails if available — skips HTML fetch
+        let cached = _movieCache[url];
+        if (!cached) {
+            await sessionPromise;
+            const data = await fetchMoviePage(url);
+            cached = { movieId: data.movieId, imdbId: data.imdbId };
+            if (data.movieId) _movieCache[url] = cached;
+        } else {
+            await sessionPromise;
         }
 
+        const { movieId, imdbId } = cached;
         if (!imdbId) return JSON.stringify({ stream: null });
 
-        // Step 1: GET /api/torrent/{imdbId} → torrentio URL
+        // Step 1: GET torrentio URL from ee3
         const torrentRes = await fetchv2(`${BASE_URL}/api/torrent/${imdbId}`, ee3Headers());
         const torrentData = JSON.parse(await torrentRes.text());
         const torrentioUrl = torrentData.torrentioUrl;
         if (!torrentioUrl) return JSON.stringify({ stream: null });
 
-        // Step 2: GET torrentio streams
+        // Step 2: GET streams from torrentio
         const streamsRes = await fetchv2(torrentioUrl, { "User-Agent": UA, "Accept": "application/json" });
         const streamsData = JSON.parse(await streamsRes.text());
         const streams = streamsData.streams || [];
-        if (streams.length === 0) return JSON.stringify({ stream: null });
+        if (!streams.length) return JSON.stringify({ stream: null });
 
-        // Pick best stream: prefer 1080p, fallback to first
+        // Prefer 1080p, fallback to first
         const preferred = streams.find(s => s.name && s.name.includes("1080p")) || streams[0];
         const infoHash = preferred.infoHash;
         const fileIdx = preferred.fileIdx !== undefined ? preferred.fileIdx : 0;
         const filename = (preferred.behaviorHints && preferred.behaviorHints.filename) || "";
 
-        // Step 3: POST /api/torrent/{imdbId} to resolve download URL
+        // Step 3: POST to resolve proxy download URL
         const postRes = await fetchv2(
             `${BASE_URL}/api/torrent/${imdbId}`,
             ee3Headers({ "Content-Type": "application/json" }),
