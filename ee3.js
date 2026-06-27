@@ -151,12 +151,17 @@ async function extractEpisodes(url) {
 }
 
 async function extractStreamUrl(url) {
+    // TEMPORARY DIAGNOSTIC — captures where the pipeline bails and what it saw, then
+    // surfaces it as the stream string (DIAG:{...}) and console.log. Remove after one run.
+    const _d = { url };
+    const _diag = (stage) => { _d.bailedAt = stage; const s = "DIAG:" + JSON.stringify(_d); try { console.log("[ee3] " + s); } catch (e) {} return JSON.stringify({ stream: s }); };
     try {
         // Ensure session and get movie identifiers in parallel when possible
         const sessionPromise = ensureSession();
 
         // Use cached imdb_id/movieId from extractDetails if available — skips HTML fetch
         let cached = _movieCache[url];
+        _d.fromCache = !!cached;
         if (!cached) {
             await sessionPromise;
             const data = await fetchMoviePage(url);
@@ -165,21 +170,30 @@ async function extractStreamUrl(url) {
         } else {
             await sessionPromise;
         }
+        _d.sessionCookie = _sessionCookie ? (_sessionCookie.slice(0, 6) + "…len" + _sessionCookie.length) : "(empty)";
 
         const { movieId, imdbId } = cached;
-        if (!imdbId) return JSON.stringify({ stream: null });
+        _d.movieId = movieId || "(null)";
+        _d.imdbId = imdbId || "(null)";
+        if (!imdbId) return _diag("imdbId-null");
 
         // Step 1: GET torrentio URL from ee3
         const torrentRes = await ee3Fetch(`${BASE_URL}/api/torrent/${imdbId}`);
-        const torrentData = JSON.parse(await torrentRes.text());
+        const torrentText = await torrentRes.text();
+        _d.torrentStatus = torrentRes.status;
+        const torrentData = JSON.parse(torrentText);
         const torrentioUrl = torrentData.torrentioUrl;
-        if (!torrentioUrl) return JSON.stringify({ stream: null });
+        _d.torrentioUrl = torrentioUrl ? "yes" : "(missing)";
+        if (!torrentioUrl) { _d.torrentBody = torrentText.slice(0, 120); return _diag("no-torrentioUrl"); }
 
         // Step 2: GET streams from torrentio
         const streamsRes = await fetchv2(torrentioUrl, { "User-Agent": UA, "Accept": "application/json" });
-        const streamsData = JSON.parse(await streamsRes.text());
+        const streamsText = await streamsRes.text();
+        _d.streamsStatus = streamsRes.status;
+        const streamsData = JSON.parse(streamsText);
         const streams = streamsData.streams || [];
-        if (!streams.length) return JSON.stringify({ stream: null });
+        _d.streamCount = streams.length;
+        if (!streams.length) { _d.streamsBody = streamsText.slice(0, 120); return _diag("no-streams"); }
 
         // Order candidates: 1080p first, then the rest. Try each in turn so a single
         // torrent that errors or is still being prepared doesn't kill the whole result.
@@ -188,33 +202,42 @@ async function extractStreamUrl(url) {
             ...streams.filter(s => !(s.name && s.name.includes("1080p")))
         ];
 
+        _d.attempts = [];
         for (const c of candidates) {
+            const a = {};
             try {
                 // Step 3: POST to resolve proxy download URL. fileIdx MUST be a string —
                 // ee3's resolve endpoint 500s ("Failed to process download") on an integer.
                 const fileIdx = c.fileIdx !== undefined ? String(c.fileIdx) : undefined;
                 const filename = (c.behaviorHints && c.behaviorHints.filename) || "";
+                a.infoHash = (c.infoHash || "").slice(0, 8);
+                a.fileIdx = fileIdx;
                 const postRes = await ee3Fetch(
                     `${BASE_URL}/api/torrent/${imdbId}`,
                     { "Content-Type": "application/json" },
                     "POST",
                     JSON.stringify({ infoHash: c.infoHash, fileIdx, movieId, filename })
                 );
-                const postData = JSON.parse(await postRes.text());
+                const postText = await postRes.text();
+                a.status = postRes.status;
+                const postData = JSON.parse(postText);
                 const downloadUrl = postData.downloadUrl;
                 // A still-preparing torrent returns 200 with a message and no downloadUrl —
                 // skip to the next candidate rather than giving up.
-                if (!downloadUrl) continue;
+                if (!downloadUrl) { a.result = postText.slice(0, 80); _d.attempts.push(a); continue; }
 
                 const fullUrl = downloadUrl.startsWith("http") ? downloadUrl : `${BASE_URL}${downloadUrl}`;
                 return JSON.stringify({ stream: fullUrl });
             } catch (e) {
+                a.error = String(e && e.message || e);
+                _d.attempts.push(a);
                 continue;
             }
         }
 
-        return JSON.stringify({ stream: null });
+        return _diag("all-candidates-failed");
     } catch (e) {
-        return JSON.stringify({ stream: null });
+        _d.error = String(e && e.message || e);
+        return _diag("exception");
     }
 }
