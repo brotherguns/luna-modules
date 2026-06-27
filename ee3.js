@@ -72,40 +72,41 @@ async function ee3Fetch(url, extra, method, body) {
 }
 
 async function fetchMoviePage(url) {
-    const res = await fetchv2(url, {
+    // Authed HTML fetch. Do NOT follow redirects: an expired/invalid session
+    // 303-redirects to /login, and following it would return login HTML (no
+    // imdb_id/tmdb_data), silently breaking extraction. On a redirect or 401/403,
+    // force a re-login once and retry so a stale cookie self-heals.
+    await ensureSession();
+    const htmlHeaders = () => ({
         "User-Agent": UA,
         "Accept": "text/html",
         "Cookie": `session=${_sessionCookie}`
     });
+    let res = await fetchv2(url, htmlHeaders(), "GET", null, false);
+    if (res.status === 401 || res.status === 403 || (res.status >= 300 && res.status < 400)) {
+        await ensureSession(true);
+        res = await fetchv2(url, htmlHeaders(), "GET", null, false);
+    }
     const html = await res.text();
     const movieId = url.split("/movies/")[1]?.split("/")[0] || "";
-    const imdbMatch = html.match(/"imdb_id"\s*:\s*"(tt\d+)"/);
+    // The SvelteKit page embeds the data as a JS object literal where the key is
+    // unquoted: `imdb_id:"tt1375666"`. The old /"imdb_id":"tt..."/ regex required a
+    // quoted key and never matched. Match an optionally-quoted key, then the tt id.
+    const imdbMatch = html.match(/["']?imdb_id["']?\s*:\s*["'](tt\d+)["']/);
     const imdbId = imdbMatch ? imdbMatch[1] : null;
 
-    // Pull description/year from inline SSR data. A [^}] regex truncates at the
-    // first nested brace, so scan for a brace-balanced object (string/escape aware).
-    let tmdb = {};
-    try {
-        const key = '"tmdb_data"';
-        const ki = html.indexOf(key);
-        if (ki !== -1) {
-            const start = html.indexOf('{', ki + key.length);
-            if (start !== -1) {
-                let depth = 0, inStr = false, esc = false, end = -1;
-                for (let i = start; i < html.length; i++) {
-                    const c = html[i];
-                    if (inStr) {
-                        if (esc) esc = false;
-                        else if (c === '\\') esc = true;
-                        else if (c === '"') inStr = false;
-                    } else if (c === '"') inStr = true;
-                    else if (c === '{') depth++;
-                    else if (c === '}') { depth--; if (depth === 0) { end = i; break; } }
-                }
-                if (end !== -1) tmdb = JSON.parse(html.slice(start, end + 1));
-            }
-        }
-    } catch (e) {}
+    // The page is a SvelteKit JS object literal (unquoted keys), not JSON, so the
+    // detail fields are read individually rather than parsed as one tmdb_data blob.
+    const field = (name) => {
+        const m = html.match(new RegExp('["\']?' + name + '["\']?\\s*:\\s*["\']((?:[^"\'\\\\]|\\\\.)*)["\']'));
+        return m ? m[1].replace(/\\(.)/g, '$1') : "";
+    };
+    const tmdb = {
+        overview: field("overview"),
+        release_date: field("release_date"),
+        title: field("title"),
+        original_title: field("original_title")
+    };
 
     return { movieId, imdbId, tmdb };
 }
@@ -180,25 +181,39 @@ async function extractStreamUrl(url) {
         const streams = streamsData.streams || [];
         if (!streams.length) return JSON.stringify({ stream: null });
 
-        // Prefer 1080p, fallback to first
-        const preferred = streams.find(s => s.name && s.name.includes("1080p")) || streams[0];
-        const infoHash = preferred.infoHash;
-        const fileIdx = preferred.fileIdx !== undefined ? preferred.fileIdx : 0;
-        const filename = (preferred.behaviorHints && preferred.behaviorHints.filename) || "";
+        // Order candidates: 1080p first, then the rest. Try each in turn so a single
+        // torrent that errors or is still being prepared doesn't kill the whole result.
+        const candidates = [
+            ...streams.filter(s => s.name && s.name.includes("1080p")),
+            ...streams.filter(s => !(s.name && s.name.includes("1080p")))
+        ];
 
-        // Step 3: POST to resolve proxy download URL
-        const postRes = await ee3Fetch(
-            `${BASE_URL}/api/torrent/${imdbId}`,
-            { "Content-Type": "application/json" },
-            "POST",
-            JSON.stringify({ infoHash, fileIdx, movieId, filename })
-        );
-        const postData = JSON.parse(await postRes.text());
-        const downloadUrl = postData.downloadUrl;
-        if (!downloadUrl) return JSON.stringify({ stream: null });
+        for (const c of candidates) {
+            try {
+                // Step 3: POST to resolve proxy download URL. fileIdx MUST be a string —
+                // ee3's resolve endpoint 500s ("Failed to process download") on an integer.
+                const fileIdx = c.fileIdx !== undefined ? String(c.fileIdx) : undefined;
+                const filename = (c.behaviorHints && c.behaviorHints.filename) || "";
+                const postRes = await ee3Fetch(
+                    `${BASE_URL}/api/torrent/${imdbId}`,
+                    { "Content-Type": "application/json" },
+                    "POST",
+                    JSON.stringify({ infoHash: c.infoHash, fileIdx, movieId, filename })
+                );
+                const postData = JSON.parse(await postRes.text());
+                const downloadUrl = postData.downloadUrl;
+                // A still-preparing torrent returns 200 with a message and no downloadUrl —
+                // skip to the next candidate rather than giving up.
+                if (!downloadUrl) continue;
 
-        const fullUrl = downloadUrl.startsWith("http") ? downloadUrl : `${BASE_URL}${downloadUrl}`;
-        return JSON.stringify({ stream: fullUrl });
+                const fullUrl = downloadUrl.startsWith("http") ? downloadUrl : `${BASE_URL}${downloadUrl}`;
+                return JSON.stringify({ stream: fullUrl });
+            } catch (e) {
+                continue;
+            }
+        }
+
+        return JSON.stringify({ stream: null });
     } catch (e) {
         return JSON.stringify({ stream: null });
     }
