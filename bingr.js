@@ -22,7 +22,16 @@ async function filmFetch(path) {
     const token = await getFilmToken();
     const headers = { "User-Agent": UA };
     if (token) headers["x-api-key"] = token;
-    const res = await fetchv2(`${FILMU_API}${path}`, headers);
+    let res = await fetchv2(`${FILMU_API}${path}`, headers);
+    if (res.status === 401 || res.status === 403) {
+        // Cached token rejected — clear both fields BEFORE re-fetching so the
+        // getFilmToken cache guard doesn't hand back the stale token, then retry once.
+        _filmToken = null;
+        _filmTokenExpiry = 0;
+        const fresh = await getFilmToken();
+        if (fresh) headers["x-api-key"] = fresh;
+        res = await fetchv2(`${FILMU_API}${path}`, headers);
+    }
     return JSON.parse(await res.text());
 }
 
@@ -130,13 +139,15 @@ async function extractStreamUrl(url) {
                 const sources = (streamData.sources || []).filter(s => s.url);
                 if (!sources.length) continue;
 
-                // Prefer 1080p, then highest quality
-                const preferred = sources.find(s =>
-                    (s.quality || s.label || "").includes("1080")
-                ) || sources[sources.length - 1];
+                // Prefer 1080p, then genuine highest quality (rank by parsed height)
+                const ranked = sources
+                    .map(s => ({ s, h: parseInt((String(s.quality || s.label || "").match(/(\d{3,4})\s*p/i) || [])[1] || "0", 10) }))
+                    .sort((a, b) => b.h - a.h);
+                const preferred = (ranked.find(x => x.h === 1080) || ranked[0]).s;
 
                 let streamUrl = preferred.url;
-                if (streamUrl.startsWith("/")) streamUrl = `${FILMU_API}${streamUrl}`;
+                if (streamUrl.startsWith("//")) streamUrl = "https:" + streamUrl;
+                else if (streamUrl.startsWith("/")) streamUrl = `${FILMU_API}${streamUrl}`;
                 if (streamData.token) {
                     streamUrl += (streamUrl.includes("?") ? "&" : "?") + `apiKey=${streamData.token}`;
                 }

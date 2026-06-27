@@ -12,8 +12,9 @@ let _loginPromise = null;
 // consumed in extractStreamUrl to avoid re-fetching the HTML page
 const _movieCache = {};
 
-async function ensureSession() {
-    if (_sessionCookie) return;
+async function ensureSession(force) {
+    if (_sessionCookie && !force) return;
+    if (force) _sessionCookie = "";
     if (_loginPromise) return _loginPromise;
     _loginPromise = (async () => {
         try {
@@ -55,6 +56,21 @@ function ee3Headers(extra) {
     return h;
 }
 
+// Authenticated fetch: ensures a session, re-logins once on a 401/403 auth bounce
+// (stale module-level cookie), and rejects non-2xx so JSON.parse only runs on a good body.
+async function ee3Fetch(url, extra, method, body) {
+    await ensureSession();
+    let res = await fetchv2(url, ee3Headers(extra), method, body);
+    if (res.status === 401 || res.status === 403) {
+        await ensureSession(true);
+        res = await fetchv2(url, ee3Headers(extra), method, body);
+    }
+    if (res.status < 200 || res.status >= 300) {
+        throw new Error("ee3 HTTP " + res.status);
+    }
+    return res;
+}
+
 async function fetchMoviePage(url) {
     const res = await fetchv2(url, {
         "User-Agent": UA,
@@ -66,11 +82,29 @@ async function fetchMoviePage(url) {
     const imdbMatch = html.match(/"imdb_id"\s*:\s*"(tt\d+)"/);
     const imdbId = imdbMatch ? imdbMatch[1] : null;
 
-    // Pull description/year from inline SSR data
+    // Pull description/year from inline SSR data. A [^}] regex truncates at the
+    // first nested brace, so scan for a brace-balanced object (string/escape aware).
     let tmdb = {};
     try {
-        const tmdbMatch = html.match(/"tmdb_data"\s*:\s*(\{[^}]{50,}\})/);
-        if (tmdbMatch) tmdb = JSON.parse(tmdbMatch[1]);
+        const key = '"tmdb_data"';
+        const ki = html.indexOf(key);
+        if (ki !== -1) {
+            const start = html.indexOf('{', ki + key.length);
+            if (start !== -1) {
+                let depth = 0, inStr = false, esc = false, end = -1;
+                for (let i = start; i < html.length; i++) {
+                    const c = html[i];
+                    if (inStr) {
+                        if (esc) esc = false;
+                        else if (c === '\\') esc = true;
+                        else if (c === '"') inStr = false;
+                    } else if (c === '"') inStr = true;
+                    else if (c === '{') depth++;
+                    else if (c === '}') { depth--; if (depth === 0) { end = i; break; } }
+                }
+                if (end !== -1) tmdb = JSON.parse(html.slice(start, end + 1));
+            }
+        }
     } catch (e) {}
 
     return { movieId, imdbId, tmdb };
@@ -78,9 +112,8 @@ async function fetchMoviePage(url) {
 
 async function searchResults(keyword) {
     try {
-        await ensureSession();
         const url = `${BASE_URL}/api/movies?title=${encodeURIComponent(keyword)}&sort=-tmdb_data.vote_average&page=1&perPage=20`;
-        const res = await fetchv2(url, ee3Headers());
+        const res = await ee3Fetch(url);
         const json = JSON.parse(await res.text());
         const items = json.items || [];
         return JSON.stringify(items.map(item => {
@@ -136,7 +169,7 @@ async function extractStreamUrl(url) {
         if (!imdbId) return JSON.stringify({ stream: null });
 
         // Step 1: GET torrentio URL from ee3
-        const torrentRes = await fetchv2(`${BASE_URL}/api/torrent/${imdbId}`, ee3Headers());
+        const torrentRes = await ee3Fetch(`${BASE_URL}/api/torrent/${imdbId}`);
         const torrentData = JSON.parse(await torrentRes.text());
         const torrentioUrl = torrentData.torrentioUrl;
         if (!torrentioUrl) return JSON.stringify({ stream: null });
@@ -154,9 +187,9 @@ async function extractStreamUrl(url) {
         const filename = (preferred.behaviorHints && preferred.behaviorHints.filename) || "";
 
         // Step 3: POST to resolve proxy download URL
-        const postRes = await fetchv2(
+        const postRes = await ee3Fetch(
             `${BASE_URL}/api/torrent/${imdbId}`,
-            ee3Headers({ "Content-Type": "application/json" }),
+            { "Content-Type": "application/json" },
             "POST",
             JSON.stringify({ infoHash, fileIdx, movieId, filename })
         );
