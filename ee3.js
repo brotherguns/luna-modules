@@ -32,6 +32,9 @@ async function ensureSession(force) {
                 false
             );
             const headers = res.headers || {};
+            // Luna's fetchv2 exposes response headers from HTTPURLResponse.allHeaderFields,
+            // lowercase-keyed over HTTP/2 — the URLSession cookie store consuming Set-Cookie
+            // does not strip it from that dictionary, so reading it here is reliable.
             const setCookie = headers["set-cookie"] || headers["Set-Cookie"] || "";
             const match = setCookie.match(/session=([^;]+)/);
             if (match) {
@@ -77,11 +80,8 @@ async function fetchMoviePage(url) {
     // imdb_id/tmdb_data), silently breaking extraction. On a redirect or 401/403,
     // force a re-login once and retry so a stale cookie self-heals.
     await ensureSession();
-    const htmlHeaders = () => ({
-        "User-Agent": UA,
-        "Accept": "text/html",
-        "Cookie": `session=${_sessionCookie}`
-    });
+    // Reuse ee3Headers so the session cookie is sent, but ask for HTML.
+    const htmlHeaders = () => ee3Headers({ "Accept": "text/html" });
     let res = await fetchv2(url, htmlHeaders(), "GET", null, false);
     if (res.status === 401 || res.status === 403 || (res.status >= 300 && res.status < 400)) {
         await ensureSession(true);
