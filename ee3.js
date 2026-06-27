@@ -59,14 +59,16 @@ function ee3Headers(extra) {
     return h;
 }
 
-// Authenticated fetch: ensures a session, re-logins once on a 401/403 auth bounce
+// Authenticated fetch: ensures a session, re-logins once on a 401/403/3xx auth bounce
 // (stale module-level cookie), and rejects non-2xx so JSON.parse only runs on a good body.
+// redirect=false is required: a stale session 303-redirects to /login, which returns 200
+// login HTML — following it would mask the auth failure and feed HTML to JSON.parse.
 async function ee3Fetch(url, extra, method, body) {
     await ensureSession();
-    let res = await fetchv2(url, ee3Headers(extra), method, body);
-    if (res.status === 401 || res.status === 403) {
+    let res = await fetchv2(url, ee3Headers(extra), method, body, false);
+    if (res.status === 401 || res.status === 403 || (res.status >= 300 && res.status < 400)) {
         await ensureSession(true);
-        res = await fetchv2(url, ee3Headers(extra), method, body);
+        res = await fetchv2(url, ee3Headers(extra), method, body, false);
     }
     if (res.status < 200 || res.status >= 300) {
         throw new Error("ee3 HTTP " + res.status);
@@ -98,7 +100,7 @@ async function fetchMoviePage(url) {
     // The page is a SvelteKit JS object literal (unquoted keys), not JSON, so the
     // detail fields are read individually rather than parsed as one tmdb_data blob.
     const field = (name) => {
-        const m = html.match(new RegExp('["\']?' + name + '["\']?\\s*:\\s*["\']((?:[^"\'\\\\]|\\\\.)*)["\']'));
+        const m = html.match(new RegExp('(?:^|[^A-Za-z0-9_])["\']?' + name + '["\']?\\s*:\\s*["\']((?:[^"\'\\\\]|\\\\.)*)["\']'));
         return m ? m[1].replace(/\\(.)/g, '$1') : "";
     };
     const tmdb = {
@@ -175,8 +177,16 @@ async function extractStreamUrl(url) {
         const torrentioUrl = torrentData.torrentioUrl;
         if (!torrentioUrl) return JSON.stringify({ stream: null });
 
-        // Step 2: GET streams from torrentio
-        const streamsRes = await fetchv2(torrentioUrl, { "User-Agent": UA, "Accept": "application/json" });
+        // Step 2: GET streams from torrentio (status-guarded; retry once on a transient 429/5xx —
+        // the second round-trip's latency is the only pacing available, JSC has no setTimeout)
+        const torrentioHeaders = { "User-Agent": UA, "Accept": "application/json" };
+        let streamsRes = await fetchv2(torrentioUrl, torrentioHeaders);
+        if (streamsRes.status < 200 || streamsRes.status >= 300) {
+            streamsRes = await fetchv2(torrentioUrl, torrentioHeaders);
+        }
+        if (streamsRes.status < 200 || streamsRes.status >= 300) {
+            return JSON.stringify({ stream: null });
+        }
         const streamsData = JSON.parse(await streamsRes.text());
         const streams = streamsData.streams || [];
         if (!streams.length) return JSON.stringify({ stream: null });
@@ -201,13 +211,16 @@ async function extractStreamUrl(url) {
             else if (/720p/.test(t)) pts += 5;
             return pts;
         };
-        const candidates = streams.slice().sort((a, b) => score(b) - score(a));
+        // Cap after sorting so both passes share a bound — torrentio can return 20-50 streams
+        // and Pass 1 does one sequential ee3 POST each; uncapped, a cold title freezes the
+        // player 15-30s. Best-container-first ordering keeps the playable source in the slice.
+        const candidates = streams.slice().sort((a, b) => score(b) - score(a)).slice(0, 8);
 
         // ee3 prepares a torrent on demand; an unprepared one returns 200 with a message and
         // no downloadUrl ("still being prepared") or 500 ("Failed to process download").
         // Re-POSTing the same request IS the poll — once warm it returns a stable downloadUrl.
         const resolveOnce = async (c) => {
-            const fileIdx = c.fileIdx !== undefined ? String(c.fileIdx) : undefined;
+            const fileIdx = (c.fileIdx !== undefined && c.fileIdx !== null) ? String(c.fileIdx) : "0";
             const filename = (c.behaviorHints && c.behaviorHints.filename) || "";
             const postRes = await ee3Fetch(
                 `${BASE_URL}/api/torrent/${imdbId}`,

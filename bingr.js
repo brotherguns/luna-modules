@@ -11,8 +11,27 @@ let _filmTokenExpiry = 0;
 
 async function getFilmToken() {
     if (_filmToken && Date.now() < _filmTokenExpiry) return _filmToken;
-    const res = await fetchv2(`${FILMU_API}/api/v1/token`, { "User-Agent": UA }, "POST", "");
-    const data = JSON.parse(await res.text());
+    // Negative-cache window: after a failure we set expiry without a token, so this
+    // skips re-hitting a dead endpoint on the next OTT iterations. filmFetch's 401/403
+    // path resets _filmTokenExpiry=0 to deliberately bypass this and force a real refetch.
+    if (!_filmToken && Date.now() < _filmTokenExpiry) return null;
+    let res;
+    try {
+        res = await fetchv2(`${FILMU_API}/api/v1/token`, { "User-Agent": UA }, "POST", "");
+    } catch (e) {
+        console.error(`filmu token network error: ${e}`);
+        _filmToken = null; _filmTokenExpiry = Date.now() + 30 * 1000; return null;
+    }
+    if (res.status < 200 || res.status >= 300) {
+        console.error(`filmu token bad status ${res.status}`);
+        _filmToken = null; _filmTokenExpiry = Date.now() + 30 * 1000; return null;
+    }
+    let data;
+    try { data = JSON.parse(await res.text()); }
+    catch (e) {
+        console.error(`filmu token non-JSON body`);
+        _filmToken = null; _filmTokenExpiry = Date.now() + 30 * 1000; return null;
+    }
     _filmToken = data.token || null;
     _filmTokenExpiry = Date.now() + 2.5 * 60 * 60 * 1000;
     return _filmToken;
@@ -32,7 +51,9 @@ async function filmFetch(path) {
         if (fresh) headers["x-api-key"] = fresh;
         res = await fetchv2(`${FILMU_API}${path}`, headers);
     }
-    return JSON.parse(await res.text());
+    // Tolerate a non-JSON error body — return {} so downstream || [] guards continue cleanly.
+    try { return JSON.parse(await res.text()); }
+    catch (e) { console.error(`filmu non-JSON body for ${path}`); return {}; }
 }
 
 async function bingrFetch(path) {
