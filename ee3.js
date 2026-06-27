@@ -181,35 +181,79 @@ async function extractStreamUrl(url) {
         const streams = streamsData.streams || [];
         if (!streams.length) return JSON.stringify({ stream: null });
 
-        // Order candidates: 1080p first, then the rest. Try each in turn so a single
-        // torrent that errors or is still being prepared doesn't kill the whole result.
-        const candidates = [
-            ...streams.filter(s => s.name && s.name.includes("1080p")),
-            ...streams.filter(s => !(s.name && s.name.includes("1080p")))
-        ];
+        // iOS AVPlayer (Luna's default Normal player) can only decode MP4/MOV/M4V with
+        // H.264/HEVC + AAC. The ee3/torrentio sources are frequently MKV or carry codecs
+        // AVPlayer rejects (HEVC 10-bit, EAC3/DTS/TrueTC), which is what produces the
+        // crossed-out play symbol even when bytes stream fine. Score each candidate by
+        // container/codec compatibility from its torrentio name + filename so a playable
+        // source is tried first, and an unplayable MKV is only used as a last resort.
+        const describe = (s) => ((s.name || "") + " " + ((s.behaviorHints && s.behaviorHints.filename) || "")).toLowerCase();
+        const score = (s) => {
+            const t = describe(s);
+            let pts = 0;
+            if (/\bmkv\b|\.mkv/.test(t)) pts -= 100;            // AVPlayer cannot demux MKV
+            if (/\bmp4\b|\.mp4/.test(t)) pts += 100;            // native container
+            if (/x264|h\.?264|avc/.test(t)) pts += 40;          // always decodable
+            if (/hevc|x265|h\.?265|10bit|10-bit/.test(t)) pts -= 30; // often 10-bit, unsupported
+            if (/eac3|dts|truehd|ac3/.test(t)) pts -= 20;       // audio AVPlayer may not decode
+            if (/aac/.test(t)) pts += 15;
+            if (/1080p/.test(t)) pts += 10;                     // quality preference, secondary
+            else if (/720p/.test(t)) pts += 5;
+            return pts;
+        };
+        const candidates = streams.slice().sort((a, b) => score(b) - score(a));
 
+        // ee3 prepares a torrent on demand; an unprepared one returns 200 with a message and
+        // no downloadUrl ("still being prepared") or 500 ("Failed to process download").
+        // Re-POSTing the same request IS the poll — once warm it returns a stable downloadUrl.
+        const resolveOnce = async (c) => {
+            const fileIdx = c.fileIdx !== undefined ? String(c.fileIdx) : undefined;
+            const filename = (c.behaviorHints && c.behaviorHints.filename) || "";
+            const postRes = await ee3Fetch(
+                `${BASE_URL}/api/torrent/${imdbId}`,
+                { "Content-Type": "application/json" },
+                "POST",
+                JSON.stringify({ infoHash: c.infoHash, fileIdx, movieId, filename })
+            );
+            const postData = JSON.parse(await postRes.text());
+            return postData.downloadUrl || null;
+        };
+
+        // Pass 1: try every candidate once and take the first already-warm (cached) source —
+        // instant playback, no waiting, best container first thanks to the scoring above.
+        const cold = [];
         for (const c of candidates) {
             try {
-                // Step 3: POST to resolve proxy download URL. fileIdx MUST be a string —
-                // ee3's resolve endpoint 500s ("Failed to process download") on an integer.
-                const fileIdx = c.fileIdx !== undefined ? String(c.fileIdx) : undefined;
-                const filename = (c.behaviorHints && c.behaviorHints.filename) || "";
-                const postRes = await ee3Fetch(
-                    `${BASE_URL}/api/torrent/${imdbId}`,
-                    { "Content-Type": "application/json" },
-                    "POST",
-                    JSON.stringify({ infoHash: c.infoHash, fileIdx, movieId, filename })
-                );
-                const postData = JSON.parse(await postRes.text());
-                const downloadUrl = postData.downloadUrl;
-                // A still-preparing torrent returns 200 with a message and no downloadUrl —
-                // skip to the next candidate rather than giving up.
-                if (!downloadUrl) continue;
-
-                const fullUrl = downloadUrl.startsWith("http") ? downloadUrl : `${BASE_URL}${downloadUrl}`;
-                return JSON.stringify({ stream: fullUrl });
+                const dl = await resolveOnce(c);
+                if (dl) {
+                    const fullUrl = dl.startsWith("http") ? dl : `${BASE_URL}${dl}`;
+                    return JSON.stringify({ stream: fullUrl });
+                }
+                cold.push(c); // resolvable endpoint, just not prepared yet
             } catch (e) {
-                continue;
+                // 500/network — torrent not processable right now; still worth a later retry
+                cold.push(c);
+            }
+        }
+
+        // Pass 2: nothing cached. Poll the best cold candidates while ee3 prepares them.
+        // The module runtime (JavaScriptCore) has no setTimeout, so we can't sleep between
+        // attempts — instead each resolveOnce is a real network round-trip (~hundreds of ms),
+        // and that latency naturally paces the poll. Bounded: a few of the highest-scored
+        // sources, several attempts each, so a genuinely missing title fails in a few seconds
+        // rather than hanging the player.
+        const POLL_TARGETS = Math.min(2, cold.length);
+        const POLL_ATTEMPTS = 6;
+        for (let i = 0; i < POLL_TARGETS; i++) {
+            const c = cold[i];
+            for (let attempt = 0; attempt < POLL_ATTEMPTS; attempt++) {
+                try {
+                    const dl = await resolveOnce(c);
+                    if (dl) {
+                        const fullUrl = dl.startsWith("http") ? dl : `${BASE_URL}${dl}`;
+                        return JSON.stringify({ stream: fullUrl });
+                    }
+                } catch (e) { /* keep polling this candidate */ }
             }
         }
 
